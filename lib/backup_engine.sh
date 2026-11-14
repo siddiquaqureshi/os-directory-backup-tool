@@ -33,6 +33,14 @@ if ! declare -F log_msg >/dev/null; then
     }
 fi
 
+# Kaneeza's modules: permission manifest/checks + timestamp change detection.
+# (incremental.sh also loads permissions.sh)
+_ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+declare -F ts_changed_list >/dev/null || source "$_ENGINE_DIR/incremental.sh"
+# Operation summaries come from logger.sh; no-ops if it is not loaded.
+declare -F log_op_start >/dev/null || log_op_start() { :; }
+declare -F log_op_end   >/dev/null || log_op_end()   { :; }
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -181,24 +189,30 @@ full_backup() {
     files="$(find "$src" -type f -o -type l 2>/dev/null | wc -l)"
     dirs="$(find "$src" -mindepth 1 -type d 2>/dev/null | wc -l)"
 
+    log_op_start full_backup "$src"
+    perm_check_source "$src"          # warns about files tar cannot read
+    echo
     echo "Backing up '$src' ($files files, $dirs sub-folders) ..."
     log_msg INFO "Full backup started: $src ($files files, $dirs folders)"
 
     # Take the timestamp BEFORE archiving so files edited while the backup
     # runs are picked up by the next incremental backup.
     local stamp; stamp="$(mktemp "$BACKUP_DIR/.stamp.XXXXXX")"
+    ts_take_snapshot "$src" "$excl"   # same idea for the change-detection index
 
     tar_opts=(-czpf "$archive" -C "$parent")
     [[ -n "$excl" ]] && tar_opts+=(--exclude="$excl")
     tar "${tar_opts[@]}" "$base" 2>"$errfile"
-    local rc=$?
+    local rc=$? nerr
+    nerr="$(grep -c . "$errfile")"
 
     # tar: 0 = ok, 1 = some file changed/unreadable while reading, 2 = fatal
     if [[ $rc -ge 2 ]]; then
         echo "ERROR: full backup failed."
         _engine_log_tar_errors "$errfile"
         log_msg ERROR "Full backup FAILED for $src (tar exit code $rc)"
-        rm -f "$archive" "$errfile" "$stamp"
+        log_op_end full_backup FAILED 0 0 "$nerr"
+        rm -f "$archive" "$errfile" "$stamp" "$TS_SNAPSHOT"
         return 1
     fi
     if [[ $rc -eq 1 ]]; then
@@ -209,10 +223,14 @@ full_backup() {
 
     mv -f "$stamp" "$(_engine_marker "$src")"
     rm -f "$errfile"
+    perm_save_manifest "$src" "$archive" "$excl"   # modes/owners for restore check
+    ts_commit_index "$src" "$excl"                 # base for next incremental
     size="$(du -h "$archive" | cut -f1)"
     log_msg INFO "Full backup of $src -> $archive ($files files, $dirs folders, $size)"
+    log_op_end full_backup "$( ((rc == 0)) && echo SUCCESS || echo WARNING )" "$files" "$dirs" "$nerr" "$archive"
     echo "Full backup created: $archive"
     echo "  Files: $files   Folders: $dirs   Archive size: $size"
+    echo "  Permission manifest: $(basename "$(perm_manifest_path "$archive")")"
     return 0
 }
 
@@ -240,47 +258,52 @@ incremental_backup() {
     listfile="$(mktemp)"
     errfile="$(mktemp)"
 
-    # Files/links modified since the last backup (all nested levels).
-    # Paths are relative to $parent, so they start with "<base>/".
-    if [[ -n "$excl" ]]; then
-        ( cd "$parent" && find "$base" \( -path "$excl" -prune \) -o \
-            \( \( -type f -o -type l \) -newer "$marker" -print0 \) ) > "$listfile" 2>/dev/null
-    else
-        ( cd "$parent" && find "$base" \( -type f -o -type l \) -newer "$marker" -print0 ) \
-            > "$listfile" 2>/dev/null
+    # Changed entries since the last backup (all nested levels), found by
+    # Kaneeza's timestamp comparison (lib/incremental.sh): new, modified,
+    # moved-in and permission-only changes, plus every folder entry so folder
+    # permissions are preserved. Paths are relative to $parent ("<base>/...").
+    # The marker is used as the reference time if no index exists yet.
+    local trc
+    stamp="$(mktemp "$BACKUP_DIR/.stamp.XXXXXX")"
+    ts_changed_list "$src" "$listfile" "$marker" "$excl"; trc=$?
+    if [[ $trc -eq 2 ]]; then
+        rm -f "$listfile" "$errfile" "$stamp"
+        echo "No usable previous backup information - running a full backup instead."
+        full_backup "$src"
+        return
+    elif [[ $trc -ne 0 ]]; then
+        echo "ERROR: could not compare '$src' with the last backup."
+        log_msg ERROR "Incremental backup FAILED for $src (change detection error)"
+        rm -f "$listfile" "$errfile" "$stamp"
+        return 1
     fi
-    count="$(tr -cd '\0' < "$listfile" | wc -c)"
+    count="$TS_CHANGED"
+    ts_report
 
     if [[ "$count" -eq 0 ]]; then
         echo "No files changed since last backup."
-        log_msg INFO "Incremental backup of $src: nothing changed"
-        rm -f "$listfile" "$errfile"
+        (( TS_DELETED > 0 )) && echo "($TS_DELETED file(s) were deleted - nothing new to archive.)"
+        log_msg INFO "Incremental backup of $src: nothing changed (deleted=$TS_DELETED)"
+        rm -f "$listfile" "$errfile" "$stamp" "$TS_SNAPSHOT" "$TS_CHANGES"
         return 0
     fi
 
-    # Also store every folder entry (no contents) so folder permissions
-    # are preserved when restoring.
-    if [[ -n "$excl" ]]; then
-        ( cd "$parent" && find "$base" \( -path "$excl" -prune \) -o \
-            \( -type d -print0 \) ) >> "$listfile" 2>/dev/null
-    else
-        ( cd "$parent" && find "$base" -type d -print0 ) >> "$listfile" 2>/dev/null
-    fi
-
+    log_op_start incremental_backup "$src"
     archive="$(_engine_archive_name incr "$base")"
+    echo
     echo "Incremental backup of '$src' ($count changed files) ..."
     log_msg INFO "Incremental backup started: $src ($count changed files)"
 
-    stamp="$(mktemp "$BACKUP_DIR/.stamp.XXXXXX")"
-
     tar -czpf "$archive" -C "$parent" --no-recursion --null -T "$listfile" 2>"$errfile"
     rc=$?
+    local nerr; nerr="$(grep -c . "$errfile")"
 
     if [[ $rc -ge 2 ]]; then
         echo "ERROR: incremental backup failed."
         _engine_log_tar_errors "$errfile"
         log_msg ERROR "Incremental backup FAILED for $src (tar exit code $rc)"
-        rm -f "$archive" "$listfile" "$errfile" "$stamp"
+        log_op_end incremental_backup FAILED 0 0 "$nerr"
+        rm -f "$archive" "$listfile" "$errfile" "$stamp" "$TS_SNAPSHOT" "$TS_CHANGES"
         return 1
     fi
     if [[ $rc -eq 1 ]]; then
@@ -291,8 +314,12 @@ incremental_backup() {
 
     mv -f "$stamp" "$marker"
     rm -f "$listfile" "$errfile"
+    ts_save_manifest "$archive"       # permissions of what is in this archive
+    ts_save_deleted "$archive"        # files removed since the last backup
+    ts_commit_index "$src" "$excl"    # new base for the next incremental
     size="$(du -h "$archive" | cut -f1)"
     log_msg INFO "Incremental backup of $src ($count files) -> $archive ($size)"
+    log_op_end incremental_backup "$( ((rc == 0)) && echo SUCCESS || echo WARNING )" "$count" 0 "$nerr" "$archive"
     echo "Incremental backup created: $archive ($count files, $size)"
     return 0
 }

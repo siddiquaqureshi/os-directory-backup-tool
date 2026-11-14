@@ -112,20 +112,37 @@ restore_menu() {
     fi
 
     echo "Restoring..."
-    local count
+    log_op_start restore "$archive"
+    local count errfile rc nerr
+    errfile="$(mktemp)"
     if [[ -n "$member" ]]; then
-        tar "${opts[@]}" -f "$archive" -C "$dest" "$member"
+        tar "${opts[@]}" -f "$archive" -C "$dest" "$member" 2>"$errfile"
     else
-        tar "${opts[@]}" -f "$archive" -C "$dest"
+        tar "${opts[@]}" -f "$archive" -C "$dest" 2>"$errfile"
     fi
+    rc=$?
+    nerr="$(log_errors_from_file "$errfile" "Restore tar")"
+    rm -f "$errfile"
 
-    if [[ $? -eq 0 ]]; then
+    if [[ $rc -eq 0 ]]; then
         count="$(find "$dest" -type f | wc -l)"
         echo "SUCCESS: restored to $dest ($count files now in destination)"
         log_msg INFO "Restore: $(basename "$archive") -> $dest ${member:+(only $member)}"
+
+        # ---- 6. permission / ownership / timestamp retention check (Kaneeza) ----
+        echo
+        local manifest status=SUCCESS
+        manifest="$(perm_manifest_path "$archive")"
+        if [[ -f "$manifest" ]]; then
+            perm_verify "$manifest" "$dest" --fix || status=WARNING
+        else
+            echo "No permission manifest for this archive - verification skipped."
+        fi
+        log_op_end restore "$status" "$count" 0 "$nerr" "$dest"
     else
         echo "ERROR: restore failed."
         log_msg ERROR "Restore FAILED: $archive -> $dest"
+        log_op_end restore FAILED 0 0 "$nerr" "$dest"
         return 1
     fi
 }

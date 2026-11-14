@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "$SCRIPT_DIR/config.sh"
 source "$SCRIPT_DIR/lib/logger.sh"          # Kaneeza
+source "$SCRIPT_DIR/lib/permissions.sh"     # Kaneeza
+source "$SCRIPT_DIR/lib/incremental.sh"     # Kaneeza
 source "$SCRIPT_DIR/lib/backup_engine.sh"   # Tahira
 source "$SCRIPT_DIR/lib/restore.sh"         # Siddiqua
 
@@ -40,11 +42,15 @@ view_logs() {
     echo "  1) Last 20 entries"
     echo "  2) Full log (press q to quit)"
     echo "  3) Errors only"
-    read -rp "Choose [1-3]: " l
+    echo "  4) Statistics"
+    echo "  5) Backup summaries only"
+    read -rp "Choose [1-5]: " l
     case "$l" in
         1) echo; tail -n 20 "$LOG_FILE" ;;
         2) less "$LOG_FILE" ;;
         3) echo; grep '\[ERROR\]' "$LOG_FILE" || echo "No errors logged." ;;
+        4) echo; log_stats ;;
+        5) echo; { grep ' SUMMARY ' "$LOG_FILE" || echo "No operations logged yet."; } | tail -n 20 ;;
         *) echo "Invalid option." ;;
     esac
 }
